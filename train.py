@@ -57,7 +57,7 @@ with io.open(textfile, encoding = 'utf-8') as file:
     
     #my method
     pattern = r"[{}]".format("!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") # create the pattern
-    text = file.read().lower()
+    text = file.read()[:1000].lower()
     text = text.replace('\n', ' ')
     text = text.strip()
     text = re.sub(pattern, "", text) 
@@ -77,16 +77,14 @@ with io.open(textfile, encoding = 'utf-8') as file:
             targets.append(n_gram_seqs.pop(-1))
             sequences.append(padding(torch.tensor(n_gram_seqs), seq_len).numpy())
 
-print("length before removing duplicates: {}".format(len(sequences)))
-sequences = list(map(tuple,sequences))
-sequences = list(set(sequences))
-sequences = list(map(np.array,sequences))
-print("length after removing duplicates: {}".format(len(sequences)))
 print("oversampling...")
+from sklearn.model_selection import train_test_split
+x_train, x_test, y_train, y_test = train_test_split(sequences, targets)
+dataset_train = DataLoader(list(zip(x_train, y_train)), shuffle=True, batch_size=batch_size, drop_last=True)
+dataset_test = DataLoader(list(zip(x_test, y_test)), shuffle=True, batch_size=batch_size, drop_last=True)
 ros = RandomOverSampler(random_state=0, sampling_strategy="not majority")
-sequences, targets = ros.fit_resample(np.array(sequences), np.array(targets))
-dataset = DataLoader(list(zip(sequences, targets)), shuffle=True, batch_size=batch_size, drop_last=True)
-print("number of examples after oversampling: {}".format(len(sequences)))
+x_train, y_train = ros.fit_resample(np.array(x_train), np.array(y_train))
+print("number of examples after oversampling: {}".format(len(x_train)))
 
 
 def positional_encoding(seq_len, d, n=10000):
@@ -290,7 +288,8 @@ print("beggining training...")
 model.train()
 luc.train()
 
-train_loss = []
+from sklearn.metrics import accuracy_score
+
 
 epochs = 1000
 log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -298,7 +297,8 @@ writer = SummaryWriter(log_dir)
 print("tensorboard log directory: {}".format(log_dir))
 batch_incr = 1
 for epoch in range(epochs):
-    for batch in tqdm(dataset):
+    for batch in tqdm(dataset_train):
+        model.train()
         optimizer.zero_grad()
         x, y = batch[0].to(device), batch[1].to(device)
         x = luc(x)
@@ -308,12 +308,44 @@ for epoch in range(epochs):
         loss = loss_func(probs, y)
         loss.backward()
         optimizer.step()
-        train_loss.append(loss.item())
-        writer.add_scalar("Cross Entropy Loss", loss.item(), batch_incr)
+     
+        writer.add_scalar("Train Cross Entropy Loss", loss.item(), batch_incr)
         words = probs2words(probs)
+        writer.add_scalar("Train Accuracy", accuracy_score(list(vocab.lookup_token(x) for x in y), words), batch_incr)
         writer.add_scalar("Repetitiveness Percentage", 1-len(set(words))/batch_size, batch_incr)
-        writer.flush()
         batch_incr+=1 
+        
+        if batch_incr%1==0:
+            with torch.no_grad():
+                for batch in tqdm(dataset_test):
+                    optimizer.zero_grad()
+                    x, y = batch[0].to(device), batch[1].to(device)
+                    x = luc(x)
+                    x = torch.add(x, P)
+                    out = model(x.float())
+                    probs = generator(out[:, -1])
+                    loss = loss_func(probs, y)   
+                    writer.add_scalar("Test Cross Entropy Loss", loss.item(), batch_incr)
+                    words = probs2words(probs)
+                    writer.add_scalar("Testing Accuracy", accuracy_score(list(vocab.lookup_token(x) for x in y), words), batch_incr) 
+                print("generating text...")           
+                test_prompt = list(yield_tokens("test_prompt.txt", tokenizer))[0]
+                test_prompt = [vocab[word] for word in test_prompt]
+                #text generation
+                for i in range(25):
+                    x = padding(torch.tensor(list(test_prompt[-32:])), seq_len)
+                    x = luc(x.to(device)) 
+                    x = torch.add(x, P)
+                    out = model(x.float())
+                    probs = generator(out[:, -1])
+                    words = probs2words(probs)
+                    next_word = words[0] 
+                    test_prompt.append(vocab[next_word])
+                gen = [vocab.lookup_token(x) for x in test_prompt]
+                gen = " ".join(gen)  
+                writer.add_text("Generared Text", gen, batch_incr)
+        writer.flush()
+        
 writer.close()
 print("saving loss plot...")
 
