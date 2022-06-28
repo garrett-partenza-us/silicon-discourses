@@ -1,24 +1,36 @@
+print("importing required libraries...")
 import io
 from torchtext.vocab import build_vocab_from_iterator
 from torchtext.data import get_tokenizer
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 import re
 import torch
 import string
+import torch.nn as nn
+from torch.nn.functional import log_softmax
+import numpy as np
+import matplotlib.pyplot as plt
+import datetime
+import copy
+import math
+from torch.utils.tensorboard import SummaryWriter
+from imblearn.over_sampling import RandomOverSampler
+import warnings
+from tqdm import tqdm
+warnings.filterwarnings("ignore")
 
 def yield_tokens(file_path, tokenizer):
+    pattern = r"[{}]".format("!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") # create the pattern
     with io.open(file_path, encoding = 'utf-8') as file:
-        for line in file:
-            if re.search('[a-zA-Z]', line):
-                line = line.lower()
-                line = line.translate(str.maketrans('', '', string.punctuation))
-                line = line.replace('\n', '')
-                line = line.strip()
-                line = tokenizer(line)
-                line.insert(0, "<sos>")
-                line.append("<eos>")
-                yield line
+        pattern = r"[{}]".format("!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") # create the pattern
+        text = file.read().lower()
+        text = text.replace('\n', ' ')
+        text = text.strip()
+        text = re.sub(pattern, "", text) 
+        text = tokenizer(text)
+        yield text
                 
 def padding(arr, seq_len, mode="right"):
     assert mode=="right" or mode=="left", "invalid padding mode"
@@ -26,7 +38,8 @@ def padding(arr, seq_len, mode="right"):
         return F.pad(arr, (0, seq_len-arr.nelement()))
     else:
         return F.pad(arr, (seq_len-arr.nelement()), 0)
-                    
+
+print("building dataset...")
 textfile = "data/discourses.mb.txt"
 tokenizer = get_tokenizer("spacy")
 contains_chars = lambda x: re.search('[a-zA-Z]', x)
@@ -37,35 +50,44 @@ d_model = 768
 d_embed = 1024
 dropout = 0.1
 seq_len = 32
-batch_size = 128
+batch_size = 256
 sequences, targets = [], []
 
 with io.open(textfile, encoding = 'utf-8') as file:
-    for line in file.readlines():
-        if contains_chars(line):
-            line = line.lower()
-            line = line.translate(str.maketrans('', '', string.punctuation))
-            line = line.replace('\n', '')
-            line = line.strip()
-            words = tokenizer(line)
-            words.insert(0, "<sos>")
-            words.append("<eos>")
-            tokens = [vocab[word] for word in words]
-            for i in range(1, len(tokens)): 
-                n_gram_seqs = tokens[:i+1]
-                targets.append(n_gram_seqs.pop(-1))
-                sequences.append(padding(torch.tensor(n_gram_seqs), seq_len))
-                
+    
+    #my method
+    pattern = r"[{}]".format("!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") # create the pattern
+    text = file.read().lower()
+    text = text.replace('\n', ' ')
+    text = text.strip()
+    text = re.sub(pattern, "", text) 
+    text = tokenizer(text)
+    windows = []
+    print("creating sliding windows...")
+    for idx in tqdm(range(len(text)-seq_len)):
+        windows.append(text[idx:idx+seq_len])
+    
+    print("creating n-grams...")
+    #medium method
+    for line in tqdm(windows):
+#         if contains_chars(line):
+        tokens = [vocab[word] for word in line]
+        for i in range(1, len(tokens)): 
+            n_gram_seqs = tokens[:i+1]
+            targets.append(n_gram_seqs.pop(-1))
+            sequences.append(padding(torch.tensor(n_gram_seqs), seq_len).numpy())
+
+print("length before removing duplicates: {}".format(len(sequences)))
+sequences = list(map(tuple,sequences))
+sequences = list(set(sequences))
+sequences = list(map(np.array,sequences))
+print("length after removing duplicates: {}".format(len(sequences)))
+print("oversampling...")
+ros = RandomOverSampler(random_state=0, sampling_strategy="not majority")
+sequences, targets = ros.fit_resample(np.array(sequences), np.array(targets))
 dataset = DataLoader(list(zip(sequences, targets)), shuffle=True, batch_size=batch_size, drop_last=True)
+print("number of examples after oversampling: {}".format(len(sequences)))
 
-
-import torch
-import torch.nn as nn
-from torch.nn.functional import log_softmax
-import numpy as np
-import matplotlib.pyplot as plt
-import copy
-import math
 
 def positional_encoding(seq_len, d, n=10000):
     p = np.zeros((seq_len, d))
@@ -229,7 +251,9 @@ class Generator(nn.Module):
 
     def forward(self, x):
         return log_softmax(self.proj(x), dim=-1)
-    
+
+print("declaring model....")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 h = 12
 N = 12
 d_ff = d_model*4
@@ -241,10 +265,10 @@ model = Decoder(
         dropout
     ), 
     N
-)
-luc = nn.Embedding(num_tokens, d_model)
-generator = Generator(d_model, num_tokens)
-P = torch.tensor(positional_encoding(seq_len, d_model, n=10000)).repeat(batch_size, 1, 1)
+).to(device)
+luc = nn.Embedding(num_tokens, d_model).to(device)
+generator = Generator(d_model, num_tokens).to(device)
+P = torch.tensor(positional_encoding(seq_len, d_model, n=10000)).repeat(batch_size, 1, 1).to(device)
 
 for param in model.parameters():
     if param.dim() > 1:
@@ -260,34 +284,38 @@ def probs2words(probs):
     
 embedding_func = lambda x: luc(torch.tensor(x, dtype=torch.long))
 loss_func = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-6)
+optimizer = optim.Adam(model.parameters(), lr=1e-5)
 
+print("beggining training...")
 model.train()
 luc.train()
 
 train_loss = []
 
-c = 0
-for batch in tqdm(dataset):
-    optimizer.zero_grad()
-    x, y = batch
-    x = luc(x)
-    x = torch.add(x, P)
-    out = model(x.float())
-    probs = generator(out[:, -1])
-    loss = loss_func(probs, y)
-    loss.backward()
-    optimizer.step()
-    
-    train_loss.append(loss.item())
-    
-    print(probs2words(probs))
-    if c == 5:
-        break
-    else:
-        c+=1
-    
-import matplotlib.pyplot as plt
+epochs = 1000
+log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+writer = SummaryWriter(log_dir)
+print("tensorboard log directory: {}".format(log_dir))
+batch_incr = 1
+for epoch in range(epochs):
+    for batch in tqdm(dataset):
+        optimizer.zero_grad()
+        x, y = batch[0].to(device), batch[1].to(device)
+        x = luc(x)
+        x = torch.add(x, P)
+        out = model(x.float())
+        probs = generator(out[:, -1])
+        loss = loss_func(probs, y)
+        loss.backward()
+        optimizer.step()
+        train_loss.append(loss.item())
+        writer.add_scalar("Cross Entropy Loss", loss.item(), batch_incr)
+        words = probs2words(probs)
+        writer.add_scalar("Repetitiveness Percentage", 1-len(set(words))/batch_size, batch_incr)
+        writer.flush()
+        batch_incr+=1 
+writer.close()
+print("saving loss plot...")
 
 plt.plot(train_loss, label="cross entropy loss", c="b")
 plt.savefig("loss.png")
