@@ -1,4 +1,3 @@
-print("importing required libraries...")
 import io
 from torchtext.vocab import build_vocab_from_iterator
 from torchtext.data import get_tokenizer
@@ -9,8 +8,11 @@ import re
 import torch
 import string
 import torch.nn as nn
+from nltk import ngrams
 from torch.nn.functional import log_softmax
+from sklearn.model_selection import train_test_split
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import datetime
 import copy
@@ -19,73 +21,51 @@ from torch.utils.tensorboard import SummaryWriter
 from imblearn.over_sampling import RandomOverSampler
 import warnings
 from tqdm import tqdm
+import sentencepiece as spm
+import random
+import argparse
+from torch import optim 
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score
+import statistics
 warnings.filterwarnings("ignore")
 
-def yield_tokens(file_path, tokenizer):
-    pattern = r"[{}]".format("!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") # create the pattern
-    with io.open(file_path, encoding = 'utf-8') as file:
-        pattern = r"[{}]".format("!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") # create the pattern
-        text = file.read().lower()
-        text = text.replace('\n', ' ')
-        text = text.strip()
-        text = re.sub(pattern, "", text) 
-        text = tokenizer(text)
-        yield text
-                
-def padding(arr, seq_len, mode="right"):
-    assert mode=="right" or mode=="left", "invalid padding mode"
-    if mode=="right":
-        return F.pad(arr, (0, seq_len-arr.nelement()))
-    else:
-        return F.pad(arr, (seq_len-arr.nelement()), 0)
-
-print("building dataset...")
-textfile = "data/discourses.mb.txt"
-tokenizer = get_tokenizer("spacy")
-contains_chars = lambda x: re.search('[a-zA-Z]', x)
-vocab = build_vocab_from_iterator(yield_tokens(textfile, tokenizer), specials=["<unk>", "<eos>", "<sos>", "<pad>"])
-vocab.set_default_index(-1)     
-num_tokens = len(vocab)
-d_model = 768
-d_embed = 1024
-dropout = 0.1
+global seq_len
 seq_len = 32
-batch_size = 256
-sequences, targets = [], []
 
-with io.open(textfile, encoding = 'utf-8') as file:
-    
-    #my method
-    pattern = r"[{}]".format("!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") # create the pattern
-    text = file.read()[:1000].lower()
-    text = text.replace('\n', ' ')
-    text = text.strip()
-    text = re.sub(pattern, "", text) 
-    text = tokenizer(text)
-    windows = []
-    print("creating sliding windows...")
-    for idx in tqdm(range(len(text)-seq_len)):
-        windows.append(text[idx:idx+seq_len])
-    
-    print("creating n-grams...")
-    #medium method
-    for line in tqdm(windows):
-#         if contains_chars(line):
-        tokens = [vocab[word] for word in line]
-        for i in range(1, len(tokens)): 
-            n_gram_seqs = tokens[:i+1]
-            targets.append(n_gram_seqs.pop(-1))
-            sequences.append(padding(torch.tensor(n_gram_seqs), seq_len).numpy())
 
-print("oversampling...")
-from sklearn.model_selection import train_test_split
-x_train, x_test, y_train, y_test = train_test_split(sequences, targets)
-dataset_train = DataLoader(list(zip(x_train, y_train)), shuffle=True, batch_size=batch_size, drop_last=True)
-dataset_test = DataLoader(list(zip(x_test, y_test)), shuffle=True, batch_size=batch_size, drop_last=True)
-ros = RandomOverSampler(random_state=0, sampling_strategy="not majority")
-x_train, y_train = ros.fit_resample(np.array(x_train), np.array(y_train))
-print("number of examples after oversampling: {}".format(len(x_train)))
+def build_dataset(textfile, sp, sample=False, size=None):
 
+    with io.open(textfile, encoding = 'utf-8') as file:
+
+        #read
+        file = file.read()
+        #ensure lowercase
+        file = file.lower()
+        #ensure remove new lines
+        file = file.replace('\n', ' ')
+        #strip
+        file = file.strip()
+        #ensure remove all punctuation but periods and question marks
+        pattern = r"[{}]".format("-!\"#$%&'()*+,/:;<=>@[\]^_`{|}~") 
+        file = re.sub(pattern, "", file)
+        #tokenizesp.encode_as_ids(file)
+        words = sp.encode_as_pieces(file)
+        tokens = sp.encode_as_ids(file)
+        #generate ngrams
+        ngram_words = ngrams(words, seq_len+1)
+        ngram_pieces = ngrams(tokens, seq_len+1)
+        #pop targets
+        X_word = (seq[:seq_len] for seq in ngram_words)
+        y_word = (seq[seq_len] for seq in ngram_words)
+        X_id = (seq[:seq_len] for seq in ngram_pieces)
+        y_id = (seq[seq_len] for seq in ngram_pieces)
+        
+        df = pd.DataFrame(list(zip(X_word, y_word, X_id, y_id)), columns = ["x_piece", "y_piece", "x_id", "y_id"])
+        
+        train_df, test_df = train_test_split(df)
+        
+        return train_df, test_df
 
 def positional_encoding(seq_len, d, n=10000):
     p = np.zeros((seq_len, d))
@@ -242,112 +222,191 @@ class PositionwiseFeedForward(nn.Module):
 class Generator(nn.Module):
     "Define standard linear + softmax generation step."
 
-    def __init__(self, d_model, vocab):
+    def __init__(self, d_model, vocab, sp):
         super(Generator, self).__init__()
         # matmul(1xd_model, d_modelxvocav) gives a 1 dimensional array of softmaxed values for each vocab word
         self.proj = nn.Linear(d_model, vocab)
+        self.sp = sp
 
     def forward(self, x):
-        return log_softmax(self.proj(x), dim=-1)
-
-print("declaring model....")
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-h = 12
-N = 12
-d_ff = d_model*4
-model = Decoder(
-    DecoderLayer(
-        d_model,
-        MultiHeadedAttention(h, d_model),
-        PositionwiseFeedForward(d_model, d_ff, dropout),
-        dropout
-    ), 
-    N
-).to(device)
-luc = nn.Embedding(num_tokens, d_model).to(device)
-generator = Generator(d_model, num_tokens).to(device)
-P = torch.tensor(positional_encoding(seq_len, d_model, n=10000)).repeat(batch_size, 1, 1).to(device)
-
-for param in model.parameters():
-    if param.dim() > 1:
-        nn.init.xavier_uniform_(param)
-        
-from torch import optim 
-from tqdm import tqdm
-
-def probs2words(probs):
-    _, next_words = torch.max(probs, dim=1)
-    next_words = (vocab.lookup_token(x) for x in next_words)
-    return list(next_words)
+        probs = log_softmax(self.proj(x), dim=-1)
+        words = self.probs2words(probs)
+        return probs, words
     
-embedding_func = lambda x: luc(torch.tensor(x, dtype=torch.long))
-loss_func = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-5)
+    def probs2words(self, probs):
+        _, next_words = torch.max(probs, dim=1)
+        next_words = (self.sp.id_to_piece(int(x)) for x in next_words)
+        return list(next_words)
+    
+    
+    
+if __name__ == '__main__':
+    
+    #parse arguments
+    parser = argparse.ArgumentParser(description="flags for training transformer")
+    parser.add_argument("--textfile", required=True, type=str, help="path to textfile file")
+    parser.add_argument("--tokenizer", required=True, type=str, help="path to tokenizer file")
+    parser.add_argument("--batchsize", required=False, default=256, type=int, help="training batch size")
+    args = parser.parse_args()
+    
+    #declare sentencepiece
+    sp = spm.SentencePieceProcessor()
+    sp.load(args.tokenizer)
+    
+    #build ngram dataset
+    train_df, test_df = build_dataset(args.textfile, sp)
+    #relevant columns (train)
+    x_train, y_train = train_df.x_id, train_df.y_id
+    #map to tensors (train)
+    x_train, y_train = list(map(torch.tensor, x_train)), list(map(torch.tensor, y_train))
+    #create dataloader (train)
+    train_loader = DataLoader(list(zip(x_train, y_train)), batch_size=args.batchsize, shuffle=True, drop_last=True)
+    #relevant columns (test)
+    x_test, y_test = test_df.x_id, test_df.y_id
+    #map to tensors (test)
+    x_test, y_test = list(map(torch.tensor, x_train)), list(map(torch.tensor, y_train))
+    #create dataloader (test)
+    test_loader = DataLoader(list(zip(x_test, y_test)), batch_size=args.batchsize, shuffle=False, drop_last=True)
 
-print("beggining training...")
-model.train()
-luc.train()
+    #model hyperparameters
+    d_model = 768
+    d_embed = 1024
+    dropout = 0.1
+    h = 12
+    N = 12
+    d_ff = d_model*4
+    
+    #use gpu if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    #declare transformer
+    model = Decoder(
+        DecoderLayer(
+            d_model,
+            MultiHeadedAttention(h, d_model),
+            PositionwiseFeedForward(d_model, d_ff, dropout),
+            dropout
+        ), 
+        N
+    ).to(device)
+    
+    #declare trainable embeddings
+    luc = nn.Embedding(sp.get_piece_size(), d_model).to(device)
+    
+    #declare output generator 
+    generator = Generator(d_model, sp.get_piece_size(), sp).to(device)
+    
+    #establish positional embedings
+    P = torch.tensor(positional_encoding(seq_len, d_model, n=10000)).repeat(args.batchsize, 1, 1).to(device)
+    
+    #create tensorboard logdir
+    model_datetime = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = "logs/fit/" + model_datetime
+    writer = SummaryWriter(log_dir)
 
-from sklearn.metrics import accuracy_score
+    #gpt3 did this so I guess we do too
+    for param in model.parameters():
+        if param.dim() > 1:
+            nn.init.xavier_uniform_(param)
+            
+    #training paramters
+    loss_func = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=1e-5)
+    epochs = 1
+    batch_incr = 0
+    
+    #training loop
+    with tqdm(total=len(train_loader)*epochs) as pbar:
 
+        for epoch in range(epochs):
 
-epochs = 1000
-log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-writer = SummaryWriter(log_dir)
-print("tensorboard log directory: {}".format(log_dir))
-batch_incr = 1
-for epoch in range(epochs):
-    for batch in tqdm(dataset_train):
-        model.train()
-        optimizer.zero_grad()
-        x, y = batch[0].to(device), batch[1].to(device)
-        x = luc(x)
-        x = torch.add(x, P)
-        out = model(x.float())
-        probs = generator(out[:, -1])
-        loss = loss_func(probs, y)
-        loss.backward()
-        optimizer.step()
-     
-        writer.add_scalar("Train Cross Entropy Loss", loss.item(), batch_incr)
-        words = probs2words(probs)
-        writer.add_scalar("Train Accuracy", accuracy_score(list(vocab.lookup_token(x) for x in y), words), batch_incr)
-        writer.add_scalar("Repetitiveness Percentage", 1-len(set(words))/batch_size, batch_incr)
-        batch_incr+=1 
-        
-        if batch_incr%1==0:
-            with torch.no_grad():
-                for batch in tqdm(dataset_test):
-                    optimizer.zero_grad()
-                    x, y = batch[0].to(device), batch[1].to(device)
-                    x = luc(x)
-                    x = torch.add(x, P)
-                    out = model(x.float())
-                    probs = generator(out[:, -1])
-                    loss = loss_func(probs, y)   
-                    writer.add_scalar("Test Cross Entropy Loss", loss.item(), batch_incr)
-                    words = probs2words(probs)
-                    writer.add_scalar("Testing Accuracy", accuracy_score(list(vocab.lookup_token(x) for x in y), words), batch_incr) 
-                print("generating text...")           
-                test_prompt = list(yield_tokens("test_prompt.txt", tokenizer))[0]
-                test_prompt = [vocab[word] for word in test_prompt]
-                #text generation
-                for i in range(25):
-                    x = padding(torch.tensor(list(test_prompt[-32:])), seq_len)
-                    x = luc(x.to(device)) 
-                    x = torch.add(x, P)
-                    out = model(x.float())
-                    probs = generator(out[:, -1])
-                    words = probs2words(probs)
-                    next_word = words[0] 
-                    test_prompt.append(vocab[next_word])
-                gen = [vocab.lookup_token(x) for x in test_prompt]
-                gen = " ".join(gen)  
-                writer.add_text("Generared Text", gen, batch_incr)
-        writer.flush()
-        
-writer.close()
-print("saving loss plot...")
+            model.train()
+            luc.train()
+            generator.train()
 
-plt.plot(train_loss, label="cross entropy loss", c="b")
-plt.savefig("loss.png")
+            for batch in train_loader:
+
+                #send x and y to device
+                x, y = batch[0].to(device), batch[1].to(device)
+                #zero out gradients
+                optimizer.zero_grad()
+                #embed to d_model
+                x = luc(x)
+                #add positional encoding
+                x = torch.add(x, P)
+                #forward pass
+                out = model(x.float())
+                #get prediction
+                probs, words = generator(out[:, -1])
+                #calculate loss
+                loss = loss_func(probs, y)
+                #backward pass
+                loss.backward()
+                #step optimizer
+                optimizer.step()
+                #update progress bar
+                pbar.update(1)
+
+                #performance metrics
+                acc_train = accuracy_score(list(sp.id_to_piece(int(x)) for x in y), words)
+                loss_train = loss.item()
+                repetitiveness_train = 1-len(set(words))/args.batchsize
+
+                #write to tensorboard logdir
+                writer.add_scalar("Loss (Train)", loss_train, batch_incr)
+                writer.add_scalar("Acc (Train)", acc_train, batch_incr)
+                writer.add_scalar("Repetitiveness (Train)", repetitiveness_train, batch_incr)
+
+                #increment total batches trained
+                batch_incr+=1 
+
+            #evaluate model every 20 batches
+            if batch_incr%20==0:
+
+                #ensure no gradients are calculated
+                with torch.no_grad():
+
+                    loss_test, acc_test, repetitiveness_test = [], [], []
+
+                    for batch in dataset_test:
+
+                        #zero gradients
+                        optimizer.zero_grad()
+                        #send x and y to device
+                        x, y = batch[0].to(device), batch[1].to(device)
+                        #embed to d_model
+                        x = luc(x)
+                        #add positional encodings
+                        x = torch.add(x, P)
+                        #forward pass
+                        out = model(x.float())
+                        #get prediction
+                        probs, words = generator(out[:, -1])
+                        #calculate loss
+                        test_losses.append(loss_func(probs, y).item())   
+                        #calculate acc
+                        test_accs.append(accuracy_score(list(sp.id_to_piece(int(x)) for x in y), words)) 
+                        #calculate repetitiveness
+                        repetitiveness.append(1-len(set(words))/args.batchsize)
+
+                    #write to tensorboard logdir
+                    writer.add_scalar("Loss (Test)", statistics.mean(loss_test), batch_incr)
+                    writer.add_scalar("Acc (Test)", statistics.mean(acc_test), batch_incr)
+                    writer.add_scalar("Repetitiveness (Test)", statistics.mean(repetitiveness_test), batch_incr)
+
+                    #save model (overwrites)
+                    torch.save({
+                        'batch': batch_incr,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'train_loss': last_train_loss,
+                        'test_loss': statistics.mean(test_losses),
+                        'train_acc': last_train_acc,
+                        'test_acc': statistics.mean(test_accs)
+                        }, "models/{}".format(model_datetime))
+
+                #force buffer
+                writer.flush()
+
+    #close tensorboard writer
+    writer.close()
