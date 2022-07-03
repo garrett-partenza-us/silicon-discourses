@@ -1,3 +1,4 @@
+import os
 import io
 from torchtext.vocab import build_vocab_from_iterator
 from torchtext.data import get_tokenizer
@@ -25,6 +26,7 @@ import sentencepiece as spm
 import random
 import argparse
 from torch import optim 
+import sys
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score
 import statistics
@@ -33,13 +35,20 @@ warnings.filterwarnings("ignore")
 global seq_len
 seq_len = 32
 
+torch.manual_seed=1902
 
-def build_dataset(textfile, sp, sample=False, size=None):
+MODELS_DIR = "models"
+LOGS_DIR = "logs/fit"
+CHECKPOINT_NAME = "model.pt"
+
+def build_dataset(textfile, sp, debug=False, size=None, test_size=1048):
 
     with io.open(textfile, encoding = 'utf-8') as file:
 
         #read
         file = file.read()
+        if debug:
+            file = file[:10000]
         #ensure lowercase
         file = file.lower()
         #ensure remove new lines
@@ -63,7 +72,7 @@ def build_dataset(textfile, sp, sample=False, size=None):
         
         df = pd.DataFrame(list(zip(X_word, y_word, X_id, y_id)), columns = ["x_piece", "y_piece", "x_id", "y_id"])
         
-        train_df, test_df = train_test_split(df)
+        train_df, test_df = train_test_split(df, test_size=test_size, random_state=1902)
         
         return train_df, test_df
 
@@ -247,14 +256,31 @@ if __name__ == '__main__':
     parser.add_argument("--textfile", required=True, type=str, help="path to textfile file")
     parser.add_argument("--tokenizer", required=True, type=str, help="path to tokenizer file")
     parser.add_argument("--batchsize", required=False, default=256, type=int, help="training batch size")
+    parser.add_argument("--pretrained", required=False, action="store_true")
+    parser.add_argument("--debug", required=False, action="store_true")
+    parser.add_argument("--model", required="--pretrained" in sys.argv, type=str)
     args = parser.parse_args()
     
+    #model folder
+    if not args.pretrained:
+        model_datetime = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        os.mkdir("{}/{}".format(MODELS_DIR, model_datetime))
+    else:
+        model_datetime = args.model
+
     #declare sentencepiece
     sp = spm.SentencePieceProcessor()
     sp.load(args.tokenizer)
     
     #build ngram dataset
-    train_df, test_df = build_dataset(args.textfile, sp)
+    if not args.pretrained:
+        train_df, test_df = build_dataset(args.textfile, sp, debug=args.debug)
+        train_df.to_pickle("{}/{}/{}".format(MODELS_DIR, model_datetime, "train.pkl"))
+        test_df.to_pickle("{}/{}/{}".format(MODELS_DIR, model_datetime, "test.pkl"))
+    else:
+        train_df = pd.read_pickle("{}/{}/{}".format(MODELS_DIR, model_datetime, "train.pkl"))
+        test_df = pd.read_pickle("{}/{}/{}".format(MODELS_DIR, model_datetime, "test.pkl"))
+
     #relevant columns (train)
     x_train, y_train = train_df.x_id, train_df.y_id
     #map to tensors (train)
@@ -278,8 +304,8 @@ if __name__ == '__main__':
     
     #use gpu if available
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    #declare transformer
+  
+    #declare transformer, embeddings, generator, and positional encoding
     model = Decoder(
         DecoderLayer(
             d_model,
@@ -289,36 +315,49 @@ if __name__ == '__main__':
         ), 
         N
     ).to(device)
-    
-    #declare trainable embeddings
-    luc = nn.Embedding(sp.get_piece_size(), d_model).to(device)
-    
-    #declare output generator 
-    generator = Generator(d_model, sp.get_piece_size(), sp).to(device)
-    
-    #establish positional embedings
-    P = torch.tensor(positional_encoding(seq_len, d_model, n=10000)).repeat(args.batchsize, 1, 1).to(device)
-    
-    #create tensorboard logdir
-    model_datetime = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = "logs/fit/" + model_datetime
-    writer = SummaryWriter(log_dir)
 
-    #gpt3 did this so I guess we do too
-    for param in model.parameters():
-        if param.dim() > 1:
-            nn.init.xavier_uniform_(param)
+    luc = nn.Embedding(sp.get_piece_size(), d_model).to(device)
+
+    generator = Generator(d_model, sp.get_piece_size(), sp).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=1e-5)
+ 
+    P = torch.tensor(positional_encoding(seq_len, d_model, n=10000)).repeat(args.batchsize, 1, 1).to(device)
+
+    #initialize state dicts if pretrained
+    if args.pretrained:
+        checkpoint = torch.load("{}/{}/{}".format(MODELS_DIR, model_datetime, CHECKPOINT_NAME))
+        model.load_state_dict(checkpoint['model_state_dict']) 
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        luc.load_state_dict(checkpoint['luc_state_dict'])
+        generator.load_state_dict(checkpoint['generator_state_dict'])
+        batch_incr = checkpoint['batch_incr']  
+    else: 
+        batch_incr = 1
+
+    #create tensorboard logdir    
+    log_dir = "{}/{}".format(LOGS_DIR, model_datetime)
+    writer = SummaryWriter(log_dir)
+    
+    if not args.pretrained:
+        for param in model.parameters():
+            if param.dim() > 1:
+                nn.init.xavier_uniform_(param)
             
     #training paramters
-    loss_func = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=1e-5)
-    epochs = 1
-    batch_incr = 0
+    loss_func = nn.CrossEntropyLoss()  
     
+    epochs = 1000
+
     #training loop
     with tqdm(total=len(train_loader)*epochs) as pbar:
+        
+        if args.pretrained:
+            pbar.update(checkpoint['epoch']*len(train_loader))
 
-        for epoch in range(epochs):
+        epoch_start = 0 if not args.pretrained else checkpoint["epoch"]
+
+        for epoch in range(epoch_start, epochs):
 
             model.train()
             luc.train()
@@ -360,53 +399,57 @@ if __name__ == '__main__':
                 #increment total batches trained
                 batch_incr+=1 
 
-            #evaluate model every 20 batches
-            if batch_incr%20==0:
+                #evaluate model every 20 batches
+                if batch_incr%32==0:
 
-                #ensure no gradients are calculated
-                with torch.no_grad():
+                    #ensure no gradients are calculated
+                    with torch.no_grad():
 
-                    loss_test, acc_test, repetitiveness_test = [], [], []
+                        loss_test, acc_test, repetitiveness_test = [], [], []
 
-                    for batch in dataset_test:
+                        for batch in test_loader:
 
-                        #zero gradients
-                        optimizer.zero_grad()
-                        #send x and y to device
-                        x, y = batch[0].to(device), batch[1].to(device)
-                        #embed to d_model
-                        x = luc(x)
-                        #add positional encodings
-                        x = torch.add(x, P)
-                        #forward pass
-                        out = model(x.float())
-                        #get prediction
-                        probs, words = generator(out[:, -1])
-                        #calculate loss
-                        test_losses.append(loss_func(probs, y).item())   
-                        #calculate acc
-                        test_accs.append(accuracy_score(list(sp.id_to_piece(int(x)) for x in y), words)) 
-                        #calculate repetitiveness
-                        repetitiveness.append(1-len(set(words))/args.batchsize)
+                            #zero gradients
+                            optimizer.zero_grad()
+                            #send x and y to device
+                            x, y = batch[0].to(device), batch[1].to(device)
+                            #embed to d_model
+                            x = luc(x)
+                            #add positional encodings
+                            x = torch.add(x, P)
+                            #forward pass
+                            out = model(x.float())
+                            #get prediction
+                            probs, words = generator(out[:, -1])
+                            #calculate loss
+                            loss_test.append(loss_func(probs, y).item())   
+                            #calculate acc
+                            acc_test.append(accuracy_score(list(sp.id_to_piece(int(x)) for x in y), words)) 
+                            #calculate repetitiveness
+                            repetitiveness_test.append(1-len(set(words))/args.batchsize)
 
-                    #write to tensorboard logdir
-                    writer.add_scalar("Loss (Test)", statistics.mean(loss_test), batch_incr)
-                    writer.add_scalar("Acc (Test)", statistics.mean(acc_test), batch_incr)
-                    writer.add_scalar("Repetitiveness (Test)", statistics.mean(repetitiveness_test), batch_incr)
-
-                    #save model (overwrites)
-                    torch.save({
-                        'batch': batch_incr,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'train_loss': last_train_loss,
-                        'test_loss': statistics.mean(test_losses),
-                        'train_acc': last_train_acc,
-                        'test_acc': statistics.mean(test_accs)
-                        }, "models/{}".format(model_datetime))
-
-                #force buffer
-                writer.flush()
+                        #write to tensorboard logdir
+                        writer.add_scalar("Loss (Test)", statistics.mean(loss_test), batch_incr)
+                        writer.add_scalar("Acc (Test)", statistics.mean(acc_test), batch_incr)
+                        writer.add_scalar("Repetitiveness (Test)", statistics.mean(repetitiveness_test), batch_incr)
+                        
+                        #save model (overwrites)
+                        torch.save({
+                            'batch_incr': batch_incr,
+                            'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'luc_state_dict': luc.state_dict(),
+                            'generator_state_dict': generator.state_dict(),
+                            'train_loss': acc_train,
+                            'test_loss': statistics.mean(loss_test),
+                            'train_acc': loss_train,
+                            'test_acc': statistics.mean(acc_test)
+                            }, "{}/{}/{}".format(MODELS_DIR, model_datetime, CHECKPOINT_NAME), _use_new_zipfile_serialization=False
+                        )
+                    
+            #force buffer
+            writer.flush()
 
     #close tensorboard writer
     writer.close()
