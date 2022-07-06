@@ -1,6 +1,1 @@
-# epictetus-v2
-
-To Do:
-1. Allow more than one sentence to force model to learn long range dependancies.
-2. Verify that padding is not influencing attention score.
-3. Why cant d_embed be a different size?
+I trained GPT-3 from scratch on Stoic philosophy to generate the lost writtings of Epictetus and Seneca. Check out this [blog](https://garrett-partenza-us.github.io/2022-07-05/silicon-discourses) post to learn more.
