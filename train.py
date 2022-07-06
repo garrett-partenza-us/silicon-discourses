@@ -11,6 +11,7 @@ import string
 import torch.nn as nn
 from nltk import ngrams
 from torch.nn.functional import log_softmax
+import shutil
 from sklearn.model_selection import train_test_split
 import numpy as np
 import pandas as pd
@@ -33,7 +34,7 @@ import statistics
 warnings.filterwarnings("ignore")
 
 global seq_len
-seq_len = 32
+seq_len = 64
 
 torch.manual_seed=1902
 
@@ -41,7 +42,7 @@ MODELS_DIR = "models"
 LOGS_DIR = "logs/fit"
 CHECKPOINT_NAME = "model.pt"
 
-def build_dataset(textfile, sp, debug=False, size=None, test_size=1048):
+def build_dataset(textfile, sp, debug=False, size=None, test_size=1024):
 
     with io.open(textfile, encoding = 'utf-8') as file:
 
@@ -62,19 +63,34 @@ def build_dataset(textfile, sp, debug=False, size=None, test_size=1048):
         words = sp.encode_as_pieces(file)
         tokens = sp.encode_as_ids(file)
         #generate ngrams
-        ngram_words = ngrams(words, seq_len+1)
-        ngram_pieces = ngrams(tokens, seq_len+1)
+        ngram_words = list(ngrams(words, seq_len+1))
+        ngram_pieces = list(ngrams(tokens, seq_len+1))
+        #seperate train and test
+        ngram_words_train = ngram_words[:len(ngram_words)-test_size-seq_len]
+        ngram_pieces_train = ngram_pieces[:len(ngram_words)-test_size-seq_len]
+        ngram_words_test = ngram_words[len(ngram_words)-test_size:]
+        ngram_pieces_test = ngram_pieces[:len(ngram_words)-test_size:]
         #pop targets
-        X_word = (seq[:seq_len] for seq in ngram_words)
-        y_word = (seq[seq_len] for seq in ngram_words)
-        X_id = (seq[:seq_len] for seq in ngram_pieces)
-        y_id = (seq[seq_len] for seq in ngram_pieces)
+        X_word_train = (seq[:seq_len] for seq in ngram_words_train)
+        y_word_train = (seq[seq_len] for seq in ngram_words_train)
+        X_id_train = (seq[:seq_len] for seq in ngram_pieces_train)
+        y_id_train = (seq[seq_len] for seq in ngram_pieces_train)
+        X_word_test = (seq[:seq_len] for seq in ngram_words_test)
+        y_word_test = (seq[seq_len] for seq in ngram_words_test)
+        X_id_test = (seq[:seq_len] for seq in ngram_pieces_test)
+        y_id_test = (seq[seq_len] for seq in ngram_pieces_test)
         
-        df = pd.DataFrame(list(zip(X_word, y_word, X_id, y_id)), columns = ["x_piece", "y_piece", "x_id", "y_id"])
+        df_train = pd.DataFrame(
+            list(zip(X_word_train, y_word_train, X_id_train, y_id_train)), columns = ["x_piece", "y_piece", "x_id", "y_id"]
+        )
+        df_test = pd.DataFrame(
+            list(zip(X_word_test, y_word_test, X_id_test, y_id_test)), columns = ["x_piece", "y_piece", "x_id", "y_id"]
+        )
         
-        train_df, test_df = train_test_split(df, test_size=test_size, random_state=1902)
-        
-        return train_df, test_df
+        print("Number of training examples: {}".format(len(df_train)))
+        print("Number of evaluation examples: {}".format(len(df_test)))
+                
+        return df_train, df_test
 
 def positional_encoding(seq_len, d, n=10000):
     p = np.zeros((seq_len, d))
@@ -259,6 +275,7 @@ if __name__ == '__main__':
     parser.add_argument("--pretrained", required=False, action="store_true")
     parser.add_argument("--debug", required=False, action="store_true")
     parser.add_argument("--model", required="--pretrained" in sys.argv, type=str)
+    parser.add_argument("--saveinterval", required=False, default=256, type=int)
     args = parser.parse_args()
     
     #model folder
@@ -399,8 +416,10 @@ if __name__ == '__main__':
                 #increment total batches trained
                 batch_incr+=1 
 
+                
+               
                 #evaluate model every 20 batches
-                if batch_incr%32==0:
+                if batch_incr%args.saveinterval==0:
 
                     #ensure no gradients are calculated
                     with torch.no_grad():
@@ -427,6 +446,8 @@ if __name__ == '__main__':
                             acc_test.append(accuracy_score(list(sp.id_to_piece(int(x)) for x in y), words)) 
                             #calculate repetitiveness
                             repetitiveness_test.append(1-len(set(words))/args.batchsize)
+                            
+
 
                         #write to tensorboard logdir
                         writer.add_scalar("Loss (Test)", statistics.mean(loss_test), batch_incr)
@@ -447,6 +468,9 @@ if __name__ == '__main__':
                             'test_acc': statistics.mean(acc_test)
                             }, "{}/{}/{}".format(MODELS_DIR, model_datetime, CHECKPOINT_NAME), _use_new_zipfile_serialization=False
                         )
+
+                        #double backup due to checkpoint overwrite
+                        shutil.copy("{}/{}/{}".format(MODELS_DIR, model_datetime, CHECKPOINT_NAME), "{}/{}/{}".format(MODELS_DIR, model_datetime, "backup.pt"))
                     
             #force buffer
             writer.flush()
