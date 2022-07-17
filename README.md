@@ -1,5 +1,5 @@
 # Overview
-This is an ongoing project to use recent advancements in generative transformers to ressurect the lost works of Stoic philosphy. Open to community contributions. Catch up with my [blog post](https://garrett-partenza-us.github.io/blog/2022/07/14/silicondiscourses.html)
+This is an ongoing project to use recent advancements in generative transformers to resurrect the lost works of Stoic philosphy. Open to community contributions. Catch up with my [blog post](https://garrett-partenza-us.github.io/blog/2022/07/14/silicondiscourses.html)
 
 # The Idea
 1. Train transformer model on Stoic text to predict the next word
